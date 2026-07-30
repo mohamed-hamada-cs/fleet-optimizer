@@ -112,6 +112,53 @@ def trip_cost(matrix: list[list[int]], order: list[int]) -> int:
     return sum(matrix[a][b] for a, b in zip(order, order[1:]))
 
 
+def check_order_structure(
+    order: list[int],
+    start: int,
+    end: int,
+    first_group: list[int],
+    second_group: list[int],
+    label_of: "dict[int, str] | None" = None,
+) -> list[str]:
+    """Describe every structural rule a proposed order breaks.
+
+    Unlike validate_order (which raises on the solver's own output), this
+    collects human-readable violations so a manager's hand-written order can be
+    shown exactly what is wrong with it.
+    """
+    name = (lambda i: (label_of or {}).get(i, str(i)))
+    problems: list[str] = []
+
+    expected = sorted([start, *first_group, *second_group, end])
+    if sorted(order) != expected:
+        missing = [name(i) for i in expected if i not in order]
+        extra = [name(i) for i in order if i not in expected]
+        duplicated = [name(i) for i in set(order) if order.count(i) > 1]
+        if missing:
+            problems.append(f"missing stops: {', '.join(missing)}")
+        if extra:
+            problems.append(f"unknown stops: {', '.join(extra)}")
+        if duplicated:
+            problems.append(f"stops listed more than once: {', '.join(duplicated)}")
+        return problems  # positional checks below would be meaningless
+
+    if order[0] != start:
+        problems.append(f"must start at {name(start)}, starts at {name(order[0])}")
+    if order[-1] != end:
+        problems.append(f"must end at {name(end)}, ends at {name(order[-1])}")
+
+    if first_group and second_group:
+        positions = {node: i for i, node in enumerate(order)}
+        earliest_second = min(positions[n] for n in second_group)
+        late = [name(n) for n in first_group if positions[n] > earliest_second]
+        if late:
+            first_second = name(min(second_group, key=lambda n: positions[n]))
+            problems.append(
+                f"{', '.join(late)} must be visited before {first_second}"
+            )
+    return problems
+
+
 def pm_order_from_am(am_order: list[int]) -> list[int]:
     """Default PM order: the AM trip mirrored (school -> students reversed -> PAs reversed -> depot).
 

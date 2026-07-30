@@ -28,7 +28,7 @@ from app.matrix_sources import (
     fetch_route_osrm,
     haversine_matrix,
 )
-from app.solver import SolverError, solve_trip, trip_cost
+from app.solver import SolverError, check_order_structure, solve_trip, trip_cost
 
 app = FastAPI(title="fleet-optimizer", docs_url=None, redoc_url=None)
 
@@ -61,6 +61,24 @@ class OptimizeRequest(BaseModel):
     stops: list[Stop] = Field(min_length=3)
     direction: Literal["am", "pm"] = "am"
     matrix_source: MatrixSource = "here"
+    # Optional: a manually-written stop order (full list of stop ids) to validate
+    # and score against the optimized one — "is the manager's order better?"
+    compare_order: Optional[list[str]] = None
+
+
+class OrderComparison(BaseModel):
+    """Manual order vs optimized, both measured on the SAME matrix (fair comparison)."""
+
+    valid: bool
+    violations: list[str]
+    manual_duration_s: Optional[int] = None
+    manual_distance_m: Optional[int] = None
+    optimized_duration_s: int
+    optimized_distance_m: int
+    saving_duration_s: Optional[int] = None
+    saving_distance_m: Optional[int] = None
+    saving_pct: Optional[float] = None
+    verdict: Optional[str] = None
 
 
 class Leg(BaseModel):
@@ -79,6 +97,7 @@ class OptimizeResponse(BaseModel):
     matrix_source: MatrixSource
     route_polyline: Optional[str] = None  # full-route geometry (OSRM mode)
     polyline_format: Optional[Literal["here-flexible", "polyline5"]] = None
+    comparison: Optional[OrderComparison] = None
     solver_version: str = SERVICE_VERSION
 
 
@@ -120,16 +139,18 @@ async def optimize(
 
     coords = [(s.lat, s.lng) for s in body.stops]
 
-    # --- 1. Travel-time matrix ---
+    # --- 1. Travel-time + distance matrices ---
     try:
         if body.matrix_source == "here":
-            matrix = await fetch_matrix(here_key, coords)
+            grids = await fetch_matrix(here_key, coords)
         elif body.matrix_source == "osrm":
-            matrix = await fetch_matrix_osrm(coords)
+            grids = await fetch_matrix_osrm(coords)
         else:
-            matrix = haversine_matrix(coords)
+            grids = haversine_matrix(coords)
     except (HereError, MatrixSourceError) as e:
         raise HTTPException(status_code=502, detail=str(e))
+    matrix = grids["durations"]
+    dist_matrix = grids["distances"]
 
     # --- 2. Solve. AM: depot -> PAs -> students -> school; PM mirrored. ---
     if body.direction == "am":
@@ -141,6 +162,53 @@ async def optimize(
         order_idx = solve_trip(matrix, start, end, first_group, second_group)
     except SolverError as e:
         raise HTTPException(status_code=500, detail=f"solver failed: {e}")
+
+    # --- 2b. Optional: score the manager's manual order on the same matrix ---
+    comparison: Optional[OrderComparison] = None
+    if body.compare_order is not None:
+        index_of = {s.id: i for i, s in enumerate(body.stops)}
+        label_of = {i: s.id for i, s in enumerate(body.stops)}
+        unknown = [sid for sid in body.compare_order if sid not in index_of]
+        manual_idx = [index_of[sid] for sid in body.compare_order if sid in index_of]
+        violations = check_order_structure(
+            manual_idx, start, end, first_group, second_group, label_of
+        )
+        if unknown:
+            violations.insert(0, f"unknown stop ids: {', '.join(unknown)}")
+
+        opt_duration = trip_cost(matrix, order_idx)
+        opt_distance = trip_cost(dist_matrix, order_idx)
+        if violations:
+            comparison = OrderComparison(
+                valid=False,
+                violations=violations,
+                optimized_duration_s=opt_duration,
+                optimized_distance_m=opt_distance,
+                verdict="manual order breaks the trip rules — cannot be compared",
+            )
+        else:
+            man_duration = trip_cost(matrix, manual_idx)
+            man_distance = trip_cost(dist_matrix, manual_idx)
+            saved = man_duration - opt_duration
+            pct = round(saved / man_duration * 100, 1) if man_duration else 0.0
+            if saved > 0:
+                verdict = f"optimized is {saved // 60} min faster ({pct}% better)"
+            elif saved == 0:
+                verdict = "manual order is already optimal"
+            else:
+                verdict = "manual order is faster — check the matrix source"
+            comparison = OrderComparison(
+                valid=True,
+                violations=[],
+                manual_duration_s=man_duration,
+                manual_distance_m=man_distance,
+                optimized_duration_s=opt_duration,
+                optimized_distance_m=opt_distance,
+                saving_duration_s=saved,
+                saving_distance_m=man_distance - opt_distance,
+                saving_pct=pct,
+                verdict=verdict,
+            )
 
     ordered_coords = [coords[i] for i in order_idx]
     pairs = list(zip(order_idx, order_idx[1:]))
@@ -196,4 +264,5 @@ async def optimize(
         matrix_source=body.matrix_source,
         route_polyline=route_polyline,
         polyline_format=polyline_format,
+        comparison=comparison,
     )

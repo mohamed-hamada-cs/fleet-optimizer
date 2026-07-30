@@ -18,8 +18,8 @@ class HereError(Exception):
     pass
 
 
-async def fetch_matrix(api_key: str, coords: list[tuple[float, float]]) -> list[list[int]]:
-    """NxN travel-time matrix (seconds) between coords [(lat, lng), ...].
+async def fetch_matrix(api_key: str, coords: list[tuple[float, float]]) -> dict:
+    """NxN travel-time (s) + distance (m) matrices between coords [(lat, lng), ...].
 
     Uses synchronous mode (async=false) — fine for our sizes (<= ~25 stops).
     regionDefinition autoCircle covers a compact UK service area.
@@ -28,7 +28,7 @@ async def fetch_matrix(api_key: str, coords: list[tuple[float, float]]) -> list[
     body = {
         "origins": origins,
         "regionDefinition": {"type": "autoCircle", "margin": 10000},
-        "matrixAttributes": ["travelTimes"],
+        "matrixAttributes": ["travelTimes", "distances"],
     }
     async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
         res = await client.post(f"{MATRIX_URL}?async=false&apiKey={api_key}", json=body)
@@ -36,15 +36,23 @@ async def fetch_matrix(api_key: str, coords: list[tuple[float, float]]) -> list[
         raise HereError(f"matrix request failed ({res.status_code}): {res.text[:300]}")
 
     payload = res.json()
-    travel_times = payload.get("matrix", {}).get("travelTimes")
-    error_codes = payload.get("matrix", {}).get("errorCodes")
+    matrix = payload.get("matrix", {})
+    travel_times = matrix.get("travelTimes")
+    distances = matrix.get("distances")
+    error_codes = matrix.get("errorCodes")
     n = len(coords)
     if not travel_times or len(travel_times) != n * n:
         raise HereError("matrix response malformed or incomplete")
     if error_codes and any(code != 0 for code in error_codes):
         bad = [i for i, code in enumerate(error_codes) if code != 0]
         raise HereError(f"matrix has unroutable cells at flat indices {bad[:10]}")
-    return [travel_times[row * n : (row + 1) * n] for row in range(n)]
+
+    def unflatten(flat: "list[int] | None") -> list[list[int]]:
+        if not flat or len(flat) != n * n:
+            return [[0] * n for _ in range(n)]
+        return [list(flat[row * n : (row + 1) * n]) for row in range(n)]
+
+    return {"durations": unflatten(travel_times), "distances": unflatten(distances)}
 
 
 async def fetch_route(

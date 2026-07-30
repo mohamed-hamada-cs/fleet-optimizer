@@ -35,13 +35,14 @@ def haversine_km(a: tuple[float, float], b: tuple[float, float]) -> float:
     return 2 * 6371.0 * math.asin(math.sqrt(h))
 
 
-def haversine_matrix(coords: list[tuple[float, float]]) -> list[list[int]]:
-    """Straight-line seconds at HAVERSINE_SPEED_KMH. Offline test mode only."""
+def haversine_matrix(coords: list[tuple[float, float]]) -> dict:
+    """Straight-line seconds/metres at HAVERSINE_SPEED_KMH. Offline test mode only."""
     seconds_per_km = 3600.0 / HAVERSINE_SPEED_KMH
-    return [
-        [int(round(haversine_km(a, b) * seconds_per_km)) for b in coords]
-        for a in coords
-    ]
+    km = [[haversine_km(a, b) for b in coords] for a in coords]
+    return {
+        "durations": [[int(round(d * seconds_per_km)) for d in row] for row in km],
+        "distances": [[int(round(d * 1000)) for d in row] for row in km],
+    }
 
 
 def _osrm_coord_path(coords: list[tuple[float, float]]) -> str:
@@ -49,28 +50,37 @@ def _osrm_coord_path(coords: list[tuple[float, float]]) -> str:
     return ";".join(f"{lng},{lat}" for lat, lng in coords)
 
 
-async def fetch_matrix_osrm(coords: list[tuple[float, float]]) -> list[list[int]]:
-    """NxN duration matrix (seconds) from the public OSRM demo /table service."""
+async def fetch_matrix_osrm(coords: list[tuple[float, float]]) -> dict:
+    """NxN duration (s) + distance (m) matrices from the public OSRM demo /table service."""
     url = f"{OSRM_BASE_URL}/table/v1/driving/{_osrm_coord_path(coords)}"
     async with httpx.AsyncClient(
         timeout=REQUEST_TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT}
     ) as client:
-        res = await client.get(url, params={"annotations": "duration"})
+        res = await client.get(url, params={"annotations": "duration,distance"})
     if res.status_code != 200:
         raise MatrixSourceError(f"osrm table failed ({res.status_code}): {res.text[:300]}")
     payload = res.json()
     if payload.get("code") != "Ok":
         raise MatrixSourceError(f"osrm table error: {str(payload)[:300]}")
-    durations = payload.get("durations")
+
     n = len(coords)
-    if not durations or len(durations) != n:
-        raise MatrixSourceError("osrm table response malformed")
-    matrix = []
-    for row in durations:
-        if len(row) != n or any(cell is None for cell in row):
-            raise MatrixSourceError("osrm table has unroutable cells")
-        matrix.append([int(round(cell)) for cell in row])
-    return matrix
+
+    def grid(key: str, required: bool) -> list[list[int]]:
+        raw = payload.get(key)
+        if not raw:
+            if required:
+                raise MatrixSourceError(f"osrm table response missing {key}")
+            return [[0] * n for _ in range(n)]
+        if len(raw) != n:
+            raise MatrixSourceError("osrm table response malformed")
+        out = []
+        for row in raw:
+            if len(row) != n or any(cell is None for cell in row):
+                raise MatrixSourceError("osrm table has unroutable cells")
+            out.append([int(round(cell)) for cell in row])
+        return out
+
+    return {"durations": grid("durations", True), "distances": grid("distances", False)}
 
 
 async def fetch_route_osrm(ordered_coords: list[tuple[float, float]]) -> dict:
