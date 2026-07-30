@@ -55,6 +55,8 @@ class Stop(BaseModel):
     kind: Literal["depot", "pa", "student", "school"]
     lat: float
     lng: float
+    # Human name used in violation messages; falls back to the id when absent.
+    label: Optional[str] = None
 
 
 class OptimizeRequest(BaseModel):
@@ -167,7 +169,7 @@ async def optimize(
     comparison: Optional[OrderComparison] = None
     if body.compare_order is not None:
         index_of = {s.id: i for i, s in enumerate(body.stops)}
-        label_of = {i: s.id for i, s in enumerate(body.stops)}
+        label_of = {i: (s.label or s.id) for i, s in enumerate(body.stops)}
         unknown = [sid for sid in body.compare_order if sid not in index_of]
         manual_idx = [index_of[sid] for sid in body.compare_order if sid in index_of]
         violations = check_order_structure(
