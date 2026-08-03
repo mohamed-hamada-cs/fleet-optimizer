@@ -117,6 +117,56 @@ def health() -> dict:
     return {"ok": True, "version": SERVICE_VERSION}
 
 
+class PathRequest(BaseModel):
+    """Road geometry for stops in a GIVEN order — no reordering."""
+
+    points: list = Field(min_length=2)  # [[lat, lng], ...] in visiting order
+    matrix_source: MatrixSource = "osrm"
+
+
+class PathResponse(BaseModel):
+    polyline: str
+    polyline_format: Literal["here-flexible", "polyline5"]
+    duration_s: int
+    distance_m: int
+
+
+@app.post("/path", response_model=PathResponse)
+async def path(
+    body: PathRequest, authorization: Optional[str] = Header(default=None)
+) -> PathResponse:
+    """Draw the road path a vehicle actually drives for an existing stop order.
+
+    Needed because the dashboard must show a real route line for every route, not
+    only ones somebody has optimized and activated.
+    """
+    _require_auth(authorization)
+    coords = [(float(p[0]), float(p[1])) for p in body.points]
+
+    here_key = os.environ.get("HERE_API_KEY")
+    if body.matrix_source == "here" and not here_key:
+        raise HTTPException(status_code=503, detail="HERE_API_KEY not configured")
+
+    try:
+        if body.matrix_source == "here":
+            legs = await fetch_route(here_key, coords)
+            return PathResponse(
+                polyline="".join(leg["polyline"] for leg in legs),
+                polyline_format="here-flexible",
+                duration_s=sum(leg["duration_s"] for leg in legs),
+                distance_m=sum(leg["length_m"] for leg in legs),
+            )
+        osrm = await fetch_route_osrm(coords)
+        return PathResponse(
+            polyline=osrm["route_polyline"],
+            polyline_format="polyline5",
+            duration_s=sum(leg["duration_s"] for leg in osrm["legs"]),
+            distance_m=sum(leg["length_m"] for leg in osrm["legs"]),
+        )
+    except (HereError, MatrixSourceError) as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+
 @app.post("/optimize", response_model=OptimizeResponse)
 async def optimize(
     body: OptimizeRequest, authorization: Optional[str] = Header(default=None)
