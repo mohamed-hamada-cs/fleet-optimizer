@@ -63,6 +63,11 @@ class OptimizeRequest(BaseModel):
     stops: list[Stop] = Field(min_length=3)
     direction: Literal["am", "pm"] = "am"
     matrix_source: MatrixSource = "here"
+    # What to minimise. MVP uses distance: it is time-independent, so the PM order can be
+    # the AM order reversed, results are reproducible run to run, and every km saved is
+    # margin (the council pays a fixed price per trip). Switch to "time" for traffic-aware
+    # punctuality — that will also require solving PM separately.
+    objective: Literal["time", "distance"] = "distance"
     # Optional: a manually-written stop order (full list of stop ids) to validate
     # and score against the optimized one — "is the manager's order better?"
     compare_order: Optional[list[str]] = None
@@ -204,6 +209,13 @@ async def optimize(
     matrix = grids["durations"]
     dist_matrix = grids["distances"]
 
+    # The solver minimises whichever matrix it is handed; the comparison still reports
+    # both time and distance. Fall back to time if the source returned no distances
+    # rather than optimising on an all-zero matrix.
+    cost_matrix = matrix
+    if body.objective == "distance" and any(any(row) for row in dist_matrix):
+        cost_matrix = dist_matrix
+
     # --- 2. Solve. AM: depot -> PAs -> students -> school; PM mirrored. ---
     if body.direction == "am":
         start, end, first_group, second_group = depots[0], schools[0], pas, students
@@ -211,7 +223,7 @@ async def optimize(
         start, end, first_group, second_group = schools[0], depots[0], students, pas
 
     try:
-        order_idx = solve_trip(matrix, start, end, first_group, second_group)
+        order_idx = solve_trip(cost_matrix, start, end, first_group, second_group)
     except SolverError as e:
         raise HTTPException(status_code=500, detail=f"solver failed: {e}")
 
