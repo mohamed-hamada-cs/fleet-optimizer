@@ -21,6 +21,7 @@ from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from app.flexpolyline import decode_flexpolyline, encode_polyline5
 from app.here_client import HereError, fetch_matrix, fetch_route
 from app.matrix_sources import (
     MatrixSourceError,
@@ -103,7 +104,7 @@ class OptimizeResponse(BaseModel):
     total_distance_m: int
     matrix_source: MatrixSource
     route_polyline: Optional[str] = None  # full-route geometry (OSRM mode)
-    polyline_format: Optional[Literal["here-flexible", "polyline5"]] = None
+    polyline_format: Optional[Literal["polyline5"]] = None
     comparison: Optional[OrderComparison] = None
     solver_version: str = SERVICE_VERSION
 
@@ -131,7 +132,7 @@ class PathRequest(BaseModel):
 
 class PathResponse(BaseModel):
     polyline: str
-    polyline_format: Literal["here-flexible", "polyline5"]
+    polyline_format: Literal["polyline5"]
     duration_s: int
     distance_m: int
 
@@ -155,9 +156,12 @@ async def path(
     try:
         if body.matrix_source == "here":
             legs = await fetch_route(here_key, coords)
+            pts: list = []
+            for leg in legs:
+                pts.extend(decode_flexpolyline(leg["polyline"]))
             return PathResponse(
-                polyline="".join(leg["polyline"] for leg in legs),
-                polyline_format="here-flexible",
+                polyline=encode_polyline5(pts),
+                polyline_format="polyline5",
                 duration_s=sum(leg["duration_s"] for leg in legs),
                 distance_m=sum(leg["length_m"] for leg in legs),
             )
@@ -283,7 +287,13 @@ async def optimize(
     try:
         if body.matrix_source == "here":
             here_legs = await fetch_route(here_key, ordered_coords)
-            polyline_format = "here-flexible"
+            # HERE speaks its own flexible-polyline format; re-encode to polyline5 so
+            # every consumer handles exactly one geometry format.
+            here_points: list = []
+            for leg in here_legs:
+                here_points.extend(decode_flexpolyline(leg["polyline"]))
+            route_polyline = encode_polyline5(here_points) if here_points else None
+            polyline_format = "polyline5"
             legs = [
                 Leg(
                     from_id=body.stops[a].id,
